@@ -20,6 +20,12 @@
 #include <fcntl.h> // For fcntl
 #include <errno.h> // For errno
 
+// ---- Control socket for app context updates ----
+static const char * CTRL_SOCK_PATH = "/tmp/whisper_ctx.sock";
+static std::string g_app_context;
+static std::mutex  g_app_mtx;
+
+
 // Very small helper: write all bytes, handling short writes
 static bool write_all(int fd, const void * data, size_t len) {
     const uint8_t * p = static_cast<const uint8_t *>(data);
@@ -151,11 +157,16 @@ static void log_ts(const std::string & msg) {
 }
 
 // ---------- Helper: create app-aware whisper prompt -----------------------------
-static std::string create_whisper_prompt(const std::string & app_name) {
-    if (app_name.empty()) {
+static std::string create_whisper_prompt() {
+    std::string current_app_copy;
+    {
+        std::lock_guard<std::mutex> lock(g_app_mtx);
+        current_app_copy = g_app_context;
+    }
+    if (current_app_copy.empty()) {
         return "";
     }
-    return "The user is currently using " + app_name + " on macOS. Here is their voice transcribed command that will be parsed for either direct transcription, keyboard shortcuts, code, or terminal commands: ";
+    return "The user is currently using " + current_app_copy + " on macOS. Here is their voice transcribed command that will be parsed for either direct transcription, keyboard shortcuts, code, or terminal commands: ";
 }
 
 // -----------------------------------------------------------------------------
@@ -167,6 +178,10 @@ static int32_t g_keep_ms   = 200;   // overlap between windows
 // When true, suppress incremental partial transcriptions and only run a final
 // full-context whisper pass after the audio stream ends (set via --no-stream).
 static bool    g_no_stream = false;
+
+// Whisper parameters
+static float   g_no_speech_thold = 0.7f;  // no speech threshold
+static bool    g_suppress_nst    = false; // suppress non-speech tokens
 
 // Adaptive-scheduler & safety-net ---------------------------------------------
 static const int32_t MIN_STEP_MS   = 400;   // lower bound for real-time feel
@@ -201,106 +216,7 @@ void process_connection(int client_fd, struct whisper_context * ctx) {
     // forward any audio data that might be received along with the header.
     pcm_ring_buffer rb;
 
-    // ------------------------------------------------------------------
-    // Optional JSON header with app context – read line before audio
-    // ------------------------------------------------------------------
-    std::string app_context;
-    {
-        // Set socket to non-blocking to poll for header
-        int flags = fcntl(client_fd, F_GETFL, 0);
-        fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
-
-        const int MAX_WAIT_MS = 100;
-        int waited_ms = 0;
-        std::string line_buffer;
-        bool done_reading_header = false;
-
-        while (!done_reading_header && waited_ms < MAX_WAIT_MS) {
-            char buf[1024];
-            ssize_t n = ::read(client_fd, buf, sizeof(buf));
-
-            if (n > 0) {
-                line_buffer.append(buf, n);
-                size_t nl_pos = line_buffer.find('\n');
-
-                if (nl_pos != std::string::npos) {
-                    std::string header_line = line_buffer.substr(0, nl_pos);
-                    std::string audio_part  = line_buffer.substr(nl_pos + 1);
-
-                    // Log the exact header received for debugging
-                    std::cerr << "[whisper-socket] Raw header: " << header_line << std::endl;
-
-                    // Remove spaces for prefix check
-                    std::string header_no_spaces;
-                    for (char c : header_line) {
-                        if (c != ' ') {
-                            header_no_spaces += c;
-                        }
-                    }
-
-                    // Check for app context header
-                    if (header_no_spaces.find("{\"type\":\"app_context\"") == 0) {
-                        size_t pos = header_no_spaces.find("\"app\":\"");
-                        if (pos != std::string::npos) {
-                            pos += 7; // skip "app":"
-                            size_t end = header_no_spaces.find('"', pos);
-                            if (end != std::string::npos) {
-                                app_context = header_no_spaces.substr(pos, end - pos);
-                            }
-                        }
-                    }
-
-                    // Any data after the newline is audio - push to ring buffer
-                    if (!audio_part.empty()) {
-                        if (audio_part.size() % sizeof(int16_t) == 0) {
-                            size_t n_samples = audio_part.size() / sizeof(int16_t);
-                            std::vector<float> f32(n_samples);
-                            const int16_t* pcm_data = reinterpret_cast<const int16_t*>(audio_part.data());
-                            for (size_t i = 0; i < n_samples; ++i) {
-                                f32[i] = static_cast<float>(pcm_data[i]) / 32768.0f;
-                            }
-                            rb.push(f32.data(), f32.size());
-                        }
-                    }
-                    done_reading_header = true;
-                }
-            } else if (n == 0) {
-                // EOF
-                done_reading_header = true;
-            } else { // n < 0
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // No data available, wait a bit
-                    usleep(5000); // 5ms
-                    waited_ms += 5;
-                } else {
-                    // A real error occurred
-                    done_reading_header = true;
-                }
-            }
-        }
-        
-        // If we timed out, treat anything in the buffer as audio
-        if (!done_reading_header && !line_buffer.empty()) {
-             if (line_buffer.size() % sizeof(int16_t) == 0) {
-                size_t n_samples = line_buffer.size() / sizeof(int16_t);
-                std::vector<float> f32(n_samples);
-                const int16_t* pcm_data = reinterpret_cast<const int16_t*>(line_buffer.data());
-                for (size_t i = 0; i < n_samples; ++i) {
-                    f32[i] = static_cast<float>(pcm_data[i]) / 32768.0f;
-                }
-                rb.push(f32.data(), f32.size());
-            }
-        }
-
-        // Restore socket to blocking mode for the reader thread
-        fcntl(client_fd, F_SETFL, flags);
-
-        if (app_context.empty()) {
-            std::cerr << "[whisper-socket] No app context received, using default prompt" << std::endl;
-        } else {
-            std::cerr << "[whisper-socket] App context: " << app_context << std::endl;
-        }
-    }
+    // No longer read headers from main socket - app context comes via control socket
 
     std::thread reader(reader_thread, client_fd, std::ref(rb), &abort_requested);
 
@@ -382,9 +298,11 @@ void process_connection(int client_fd, struct whisper_context * ctx) {
             wparams.max_tokens       = 0;
             wparams.n_threads        = n_threads;
             wparams.beam_search.beam_size = beam_size;
+            wparams.no_speech_thold  = g_no_speech_thold;
+            wparams.suppress_nst     = g_suppress_nst;
 
-            // Set app-aware initial prompt for better transcription
-            std::string prompt = create_whisper_prompt(app_context);
+            // Set app-aware initial prompt for better transcription - get fresh value each time
+            std::string prompt = create_whisper_prompt();
             wparams.initial_prompt = prompt.empty() ? nullptr : prompt.c_str();
             
             if (wparams.initial_prompt) {
@@ -454,11 +372,13 @@ void process_connection(int client_fd, struct whisper_context * ctx) {
         wparams_final.max_tokens       = 0;
         wparams_final.n_threads        = n_threads;
         wparams_final.beam_search.beam_size = beam_size;
+        wparams_final.no_speech_thold  = g_no_speech_thold;
+        wparams_final.suppress_nst     = g_suppress_nst;
 
-        // Set app-aware initial prompt for better transcription
-        std::string prompt = create_whisper_prompt(app_context);
+        // Set app-aware initial prompt for better transcription - get fresh value for final pass
+        std::string prompt = create_whisper_prompt();
         wparams_final.initial_prompt = prompt.empty() ? nullptr : prompt.c_str();
-        
+
         if (wparams_final.initial_prompt) {
             std::cerr << "[whisper-socket] Final pass using prompt: \"" << wparams_final.initial_prompt << "\"" << std::endl;
         } else {
@@ -498,7 +418,18 @@ static bool whisper_should_abort(void * user_data) {
 
 // ---------- Main ------------------------------------------------------------------
 
+struct whisper_context * g_ctx = nullptr;
+
+void cleanup(int sig) {
+    if (g_ctx) {
+        whisper_free(g_ctx);
+        g_ctx = nullptr;
+    }
+    exit(0);
+}
+
 int main(int argc, char ** argv) {
+    signal(SIGPIPE, SIG_IGN);
     const char * sock_path = "/tmp/whisper_stream.sock";
     if (argc > 1 && std::strcmp(argv[1], "--socket") == 0 && argc > 2) {
         sock_path = argv[2];
@@ -512,6 +443,8 @@ int main(int argc, char ** argv) {
             g_length_ms = std::atoi(argv[i + 1]);
         } else if (std::strcmp(argv[i], "--keep") == 0) {
             g_keep_ms = std::atoi(argv[i + 1]);
+        } else if (std::strcmp(argv[i], "-nth") == 0 || std::strcmp(argv[i], "--no-speech-thold") == 0) {
+            g_no_speech_thold = std::atof(argv[i + 1]);
         }
     }
 
@@ -519,6 +452,8 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--no-stream") == 0) {
             g_no_stream = true;
+        } else if (std::strcmp(argv[i], "-sns") == 0 || std::strcmp(argv[i], "--suppress-nst") == 0 || std::strcmp(argv[i], "--suppress_nst") == 0) {
+            g_suppress_nst = true;
         }
     }
 
@@ -546,6 +481,46 @@ int main(int argc, char ** argv) {
 
     std::cerr << "[whisper-socket] listening on " << sock_path << std::endl;
 
+    // ---- start control socket thread to receive app context asynchronously ----
+    std::thread ctrl_thread([](){
+        ::unlink(CTRL_SOCK_PATH);
+        int ctrl_fd = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+        if (ctrl_fd < 0) {
+            perror("ctrl socket");
+            return;
+        }
+        struct sockaddr_un caddr; std::memset(&caddr, 0, sizeof(caddr));
+        caddr.sun_family = AF_UNIX;
+        std::strncpy(caddr.sun_path, CTRL_SOCK_PATH, sizeof(caddr.sun_path)-1);
+        if (::bind(ctrl_fd, (struct sockaddr*)&caddr, sizeof(caddr)) < 0) {
+            perror("ctrl bind");
+            return;
+        }
+        char buf[256];
+        while (true) {
+            ssize_t n = ::recvfrom(ctrl_fd, buf, sizeof(buf)-1, 0, nullptr, nullptr);
+            if (n <= 0) continue;
+            buf[n] = 0;
+            std::string line(buf, n);
+            if (line.find("\"type\":\"app_context\"") != std::string::npos) {
+                size_t pos = line.find("\"app\":\"");
+                if (pos != std::string::npos) {
+                    pos += 7;
+                    size_t end = line.find('"', pos);
+                    if (end != std::string::npos) {
+                        std::string app = line.substr(pos, end - pos);
+                        {
+                            std::lock_guard<std::mutex> lock(g_app_mtx);
+                            g_app_context = app;
+                        }
+                        std::cerr << "[whisper-socket] Updated app context: " << app << std::endl;
+                    }
+                }
+            }
+        }
+    });
+    ctrl_thread.detach();
+
     ggml_backend_load_all();
 
     // ---------------------------------------------------------------------
@@ -567,10 +542,13 @@ int main(int argc, char ** argv) {
     cparams.use_gpu  = true;
     cparams.flash_attn = true;
     struct whisper_context * ctx = whisper_init_from_file_with_params(model_path, cparams);
-    if (!ctx) {
+    g_ctx = ctx;
+    if (!g_ctx) {
         std::cerr << "failed to load model" << std::endl;
         return 2;
     }
+    signal(SIGINT, cleanup);
+    signal(SIGTERM, cleanup);
 
     while (true) {
         int client_fd = ::accept(srv_fd, nullptr, nullptr);
@@ -583,6 +561,5 @@ int main(int argc, char ** argv) {
         std::cerr << "[whisper-socket] client done" << std::endl;
     }
 
-    whisper_free(ctx);
     return 0;
 }
