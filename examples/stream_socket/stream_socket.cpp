@@ -171,8 +171,8 @@ static std::string create_whisper_prompt() {
 
 // -----------------------------------------------------------------------------
 // Global config (tuned via CLI in main)
-static int32_t g_step_ms   = 500;   // emit partials every 0.5 s
-static int32_t g_length_ms = 10000; // 10-s rolling window fed to Whisper
+static int32_t g_step_ms   = 700;   // emit partials every 0.5 s
+static int32_t g_length_ms = 30000; // 10-s rolling window fed to Whisper
 static int32_t g_keep_ms   = 200;   // overlap between windows
 
 // When true, suppress incremental partial transcriptions and only run a final
@@ -184,13 +184,13 @@ static float   g_no_speech_thold = 0.7f;  // no speech threshold
 static bool    g_suppress_nst    = false; // suppress non-speech tokens
 
 // Adaptive-scheduler & safety-net ---------------------------------------------
-static const int32_t MIN_STEP_MS   = 400;   // lower bound for real-time feel
-static const int32_t MAX_STEP_MS   = 2000;  // upper bound – keeps latency bounded
+static const int32_t MIN_STEP_MS   = g_step_ms;   // lower bound for real-time feel
+static const int32_t MAX_STEP_MS   = 10000;  // upper bound – keeps latency bounded
 static const float   EWMA_ALPHA    = 0.30f; // smoothing for running average
 static const float   SAFETY_FACTOR = 1.10f; // 10 % head-room between passes
 
 // Ring-buffer hard cap (discard oldest audio when exceeded)
-static const int32_t RING_CAP_MS   = 20000; // never queue more than 20 s
+static const int32_t RING_CAP_MS   = 30000; // never queue more than 20 s
 
 // ---------- Main per-connection handler -------------------------------------------
 
@@ -402,6 +402,10 @@ void process_connection(int client_fd, struct whisper_context * ctx) {
     }
 
     send_json("final", final_transcript);
+
+    // Small delay to ensure final JSON is fully transmitted before closing connection
+    // This prevents race condition where connection closes before interpreter reads final data
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     log_ts("Mic ended / connection closed");
 
