@@ -177,7 +177,7 @@ static int32_t g_keep_ms   = 200;   // overlap between windows
 
 // When true, suppress incremental partial transcriptions and only run a final
 // full-context whisper pass after the audio stream ends (set via --no-stream).
-static bool    g_no_stream = false;
+static std::atomic<bool> g_no_stream{false};
 
 // Whisper parameters
 static float   g_no_speech_thold = 0.7f;  // no speech threshold
@@ -520,6 +520,10 @@ int main(int argc, char ** argv) {
                         std::cerr << "[whisper-socket] Updated app context: " << app << std::endl;
                     }
                 }
+            } else if (line.find("\"type\":\"stream\"") != std::string::npos) {
+                bool on = line.find("\"enabled\":true") != std::string::npos;
+                g_no_stream = !on;
+                std::cerr << "[whisper-socket] Streaming " << (on ? "ENABLED" : "DISABLED") << std::endl;
             }
         }
     });
