@@ -181,6 +181,8 @@ static std::atomic<bool> g_no_stream{false};
 
 // Whisper parameters
 static float   g_no_speech_thold = 0.7f;  // no speech threshold
+static bool    g_enable_vad      = false; // enable voice activity detection
+static std::string g_vad_model_path;      // optional path to VAD model
 static bool    g_suppress_nst    = false; // suppress non-speech tokens
 
 // Adaptive-scheduler & safety-net ---------------------------------------------
@@ -300,6 +302,8 @@ void process_connection(int client_fd, struct whisper_context * ctx) {
             wparams.beam_search.beam_size = beam_size;
             wparams.no_speech_thold  = g_no_speech_thold;
             wparams.suppress_nst     = g_suppress_nst;
+            wparams.vad              = g_enable_vad;
+            wparams.vad_model_path   = g_vad_model_path.empty() ? nullptr : g_vad_model_path.c_str();
 
             // Set app-aware initial prompt for better transcription - get fresh value each time
             std::string prompt = create_whisper_prompt();
@@ -374,6 +378,8 @@ void process_connection(int client_fd, struct whisper_context * ctx) {
         wparams_final.beam_search.beam_size = beam_size;
         wparams_final.no_speech_thold  = g_no_speech_thold;
         wparams_final.suppress_nst     = g_suppress_nst;
+        wparams_final.vad              = g_enable_vad;
+        wparams_final.vad_model_path   = g_vad_model_path.empty() ? nullptr : g_vad_model_path.c_str();
 
         // Set app-aware initial prompt for better transcription - get fresh value for final pass
         std::string prompt = create_whisper_prompt();
@@ -435,6 +441,23 @@ void cleanup(int sig) {
 int main(int argc, char ** argv) {
     signal(SIGPIPE, SIG_IGN);
     const char * sock_path = "/tmp/whisper_stream.sock";
+
+    // Print help/usage if requested or no args
+    if (argc == 1 || (argc > 1 && (std::strcmp(argv[1], "-h") == 0 || std::strcmp(argv[1], "--help") == 0))) {
+        std::cerr << "Usage: " << argv[0] << " [options]\n"
+                  << "  --socket PATH         Path to UNIX socket (default: /tmp/whisper_stream.sock)\n"
+                  << "  --step N             Emit partials every N ms (default: 700)\n"
+                  << "  --length N           Rolling window length in ms (default: 30000)\n"
+                  << "  --keep N             Overlap between windows in ms (default: 200)\n"
+                  << "  -nth N, --no-speech-thold N  No speech probability threshold (default: 0.7)\n"
+                  << "  --vad                Enable voice activity detection (VAD) before transcription\n"
+                  << "  --vad-model PATH, --vad-path PATH  Path to custom VAD model (.bin)\n"
+                  << "  --no-stream          Only run final full-context pass after stream ends\n"
+                  << "  -sns, --suppress-nst Suppress non-speech tokens\n"
+                  << "  -h, --help           Show this help message\n";
+        return 0;
+    }
+
     if (argc > 1 && std::strcmp(argv[1], "--socket") == 0 && argc > 2) {
         sock_path = argv[2];
     }
@@ -449,7 +472,15 @@ int main(int argc, char ** argv) {
             g_keep_ms = std::atoi(argv[i + 1]);
         } else if (std::strcmp(argv[i], "-nth") == 0 || std::strcmp(argv[i], "--no-speech-thold") == 0) {
             g_no_speech_thold = std::atof(argv[i + 1]);
+        } else if (std::strcmp(argv[i], "--vad-model") == 0 || std::strcmp(argv[i], "--vad-path") == 0) {
+            g_vad_model_path = argv[i + 1];
         }
+    }
+
+    // Warn if VAD requested but no model path provided
+    if (g_enable_vad && g_vad_model_path.empty()) {
+        std::cerr << "[whisper-socket] --vad specified but no --vad-model/--vad-path given. Disabling VAD." << std::endl;
+        g_enable_vad = false;
     }
 
     // Independent scan for flag-style options (no additional parameter)
@@ -458,6 +489,8 @@ int main(int argc, char ** argv) {
             g_no_stream = true;
         } else if (std::strcmp(argv[i], "-sns") == 0 || std::strcmp(argv[i], "--suppress-nst") == 0 || std::strcmp(argv[i], "--suppress_nst") == 0) {
             g_suppress_nst = true;
+        } else if (std::strcmp(argv[i], "--vad") == 0) {
+            g_enable_vad = true;
         }
     }
 
