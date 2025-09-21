@@ -20,6 +20,19 @@
 #include <fcntl.h> // For fcntl
 #include <errno.h> // For errno
 
+// NOTE [2025-09-21]:
+// The non-streaming mode previously lost audio older than ~30 s because we applied a
+// ring-buffer "cap" (RING_CAP_MS = 30000) even when g_no_stream was enabled.
+// In non-streaming flows the producer writes the entire audio quickly, the consumer
+// pops in fixed steps, and the cap discards the oldest unconsumed samples. As a result
+// only the most recent ~30 s survived to the final pass.
+//
+// Fix:
+// - Do NOT apply any ring-buffer capping in non-streaming mode.
+// - Add a --ring-cap <ms> CLI option (default 30000). Set to 0 to disable capping.
+//   The cap is only honored when streaming is enabled. Non-streaming ignores it.
+// - Clean up comments to reflect the actual default window sizes.
+
 // ---- Control socket for app context updates ----
 static const char * CTRL_SOCK_PATH = "/tmp/whisper_ctx.sock";
 static std::string g_app_context;
@@ -171,9 +184,9 @@ static std::string create_whisper_prompt() {
 
 // -----------------------------------------------------------------------------
 // Global config (tuned via CLI in main)
-static int32_t g_step_ms   = 700;   // emit partials every 0.5 s
-static int32_t g_length_ms = 30000; // 10-s rolling window fed to Whisper
-static int32_t g_keep_ms   = 200;   // overlap between windows
+static int32_t g_step_ms   = 700;    // emit partials every 700 ms
+static int32_t g_length_ms = 30000;  // 30-s rolling window fed to Whisper (streaming)
+static int32_t g_keep_ms   = 200;    // overlap between windows
 
 // When true, suppress incremental partial transcriptions and only run a final
 // full-context whisper pass after the audio stream ends (set via --no-stream).
@@ -187,12 +200,12 @@ static bool    g_suppress_nst    = false; // suppress non-speech tokens
 
 // Adaptive-scheduler & safety-net ---------------------------------------------
 static const int32_t MIN_STEP_MS   = g_step_ms;   // lower bound for real-time feel
-static const int32_t MAX_STEP_MS   = 10000;  // upper bound – keeps latency bounded
-static const float   EWMA_ALPHA    = 0.30f; // smoothing for running average
-static const float   SAFETY_FACTOR = 1.10f; // 10 % head-room between passes
+static const int32_t MAX_STEP_MS   = 10000;       // upper bound – keeps latency bounded
+static const float   EWMA_ALPHA    = 0.30f;       // smoothing for running average
+static const float   SAFETY_FACTOR = 1.10f;       // 10 % head-room between passes
 
-// Ring-buffer hard cap (discard oldest audio when exceeded)
-static const int32_t RING_CAP_MS   = 30000; // never queue more than 20 s
+// Ring-buffer cap (discard oldest audio when exceeded) – streaming only
+static int32_t g_ring_cap_ms = 30000; // default 30 s, set --ring-cap 0 to disable
 
 // ---------- Main per-connection handler -------------------------------------------
 
@@ -224,9 +237,9 @@ void process_connection(int client_fd, struct whisper_context * ctx) {
 
     std::vector<float> pcmf32_old;
     // Capture the *entire* audio stream so we can run a final full-context
-    // transcription once the user stops speaking.  This guarantees that the
-    // final output covers the *whole* utterance (even >60 s) instead of only
-    // whatever fit into the rolling 10-s window used for partial updates.
+    // transcription once the user stops speaking. This guarantees that the
+    // final output covers the whole utterance instead of only what fits in
+    // the rolling window.
     std::vector<float> pcmf32_all;
     // Accumulated transcript across all iterations
     std::string transcript_accum;
@@ -342,12 +355,16 @@ void process_connection(int client_fd, struct whisper_context * ctx) {
         }
 
         // ------------------------------------------------------------------
-        // Ring-buffer cap – discard oldest audio if backlog exceeds threshold
+        // Ring-buffer cap – discard oldest audio if backlog exceeds threshold.
+        // IMPORTANT: This is ONLY applied in streaming mode. In non-streaming
+        // mode we must not drop any audio so the final pass sees the full input.
         // ------------------------------------------------------------------
-        while (rb.duration_ms() > RING_CAP_MS) {
-            rb.drop(n_samples_step);
+        if (!g_no_stream && g_ring_cap_ms > 0) {
+            while (rb.duration_ms() > g_ring_cap_ms) {
+                rb.drop(n_samples_step);
+            }
         }
-        }
+    }
 
     // flush leftovers
     {
@@ -445,16 +462,17 @@ int main(int argc, char ** argv) {
     // Print help/usage if requested or no args
     if (argc == 1 || (argc > 1 && (std::strcmp(argv[1], "-h") == 0 || std::strcmp(argv[1], "--help") == 0))) {
         std::cerr << "Usage: " << argv[0] << " [options]\n"
-                  << "  --socket PATH         Path to UNIX socket (default: /tmp/whisper_stream.sock)\n"
-                  << "  --step N             Emit partials every N ms (default: 700)\n"
-                  << "  --length N           Rolling window length in ms (default: 30000)\n"
-                  << "  --keep N             Overlap between windows in ms (default: 200)\n"
-                  << "  -nth N, --no-speech-thold N  No speech probability threshold (default: 0.7)\n"
-                  << "  --vad                Enable voice activity detection (VAD) before transcription\n"
+                  << "  --socket PATH                 Path to UNIX socket (default: /tmp/whisper_stream.sock)\n"
+                  << "  --step N                      Emit partials every N ms (default: 700)\n"
+                  << "  --length N                    Rolling window length in ms (streaming; default: 30000)\n"
+                  << "  --keep N                      Overlap between windows in ms (default: 200)\n"
+                  << "  -nth N, --no-speech-thold N   No speech probability threshold (default: 0.7)\n"
+                  << "  --vad                         Enable voice activity detection (VAD) before transcription\n"
                   << "  --vad-model PATH, --vad-path PATH  Path to custom VAD model (.bin)\n"
-                  << "  --no-stream          Only run final full-context pass after stream ends\n"
-                  << "  -sns, --suppress-nst Suppress non-speech tokens\n"
-                  << "  -h, --help           Show this help message\n";
+                  << "  --no-stream                   Only run final full-context pass after stream ends\n"
+                  << "  --ring-cap MS                 Max backlog to keep in ring buffer during streaming (0 = unlimited, default: 30000)\n"
+                  << "  -sns, --suppress-nst          Suppress non-speech tokens\n"
+                  << "  -h, --help                    Show this help message\n";
         return 0;
     }
 
@@ -474,6 +492,9 @@ int main(int argc, char ** argv) {
             g_no_speech_thold = std::atof(argv[i + 1]);
         } else if (std::strcmp(argv[i], "--vad-model") == 0 || std::strcmp(argv[i], "--vad-path") == 0) {
             g_vad_model_path = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--ring-cap") == 0) {
+            g_ring_cap_ms = std::atoi(argv[i + 1]);
+            if (g_ring_cap_ms < 0) g_ring_cap_ms = 0;
         }
     }
 
