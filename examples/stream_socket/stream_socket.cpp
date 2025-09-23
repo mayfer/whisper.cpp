@@ -12,6 +12,7 @@
 #include <cstring>
 #include <iostream>
 #include <mutex>
+#include <condition_variable>
 #include <string>
 #include <thread>
 #include <vector>
@@ -62,18 +63,25 @@ public:
     // blocking pop of up to n samples – returns 0 if finished and nothing left
     size_t pop(size_t n, std::vector<float> & out) {
         std::unique_lock<std::mutex> lock(m_mtx);
-        m_cv.wait(lock, [&]{ return m_finished || m_buf.size() >= n; });
-        size_t n_pop = std::min(n, m_buf.size());
-        if (n_pop == 0) return 0;
-        out.assign(m_buf.begin(), m_buf.begin() + n_pop);
-        m_buf.erase(m_buf.begin(), m_buf.begin() + n_pop);
+        m_cv.wait(lock, [&]{ return m_finished || available_unlocked() >= n; });
+
+        size_t avail = available_unlocked();
+        size_t n_pop = std::min(n, avail);
+        if (n_pop == 0) {
+            return 0;
+        }
+
+        out.assign(m_buf.begin() + m_head, m_buf.begin() + m_head + n_pop);
+        m_head += n_pop;
+        compact_unlocked();
         return n_pop;
     }
 
     void pop_all(std::vector<float> & out) {
         std::lock_guard<std::mutex> lock(m_mtx);
-        out.assign(m_buf.begin(), m_buf.end());
-        m_buf.clear();
+        size_t avail = available_unlocked();
+        out.assign(m_buf.begin() + m_head, m_buf.begin() + m_head + avail);
+        reset_unlocked();
     }
 
     void mark_finished() {
@@ -84,27 +92,61 @@ public:
 
     bool finished() const {
         std::lock_guard<std::mutex> lock(m_mtx);
-        return m_finished && m_buf.empty();
+        return m_finished && available_unlocked() == 0;
     }
 
     // Drop the first n samples (no-op if fewer are present)
     void drop(size_t n) {
         std::lock_guard<std::mutex> lock(m_mtx);
-        if (n >= m_buf.size()) {
-            m_buf.clear();
+        size_t avail = available_unlocked();
+        if (n >= avail) {
+            reset_unlocked();
         } else {
-            m_buf.erase(m_buf.begin(), m_buf.begin() + n);
+            m_head += n;
+            compact_unlocked();
         }
     }
 
     // Current buffered duration in milliseconds
     size_t duration_ms() const {
         std::lock_guard<std::mutex> lock(m_mtx);
-        return (m_buf.size() * 1000) / WHISPER_SAMPLE_RATE;
+        return (available_unlocked() * 1000) / WHISPER_SAMPLE_RATE;
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(m_mtx);
+        return available_unlocked();
     }
 
 private:
+    size_t available_unlocked() const {
+        return m_buf.size() - m_head;
+    }
+
+    void compact_unlocked() {
+        if (m_head == 0) {
+            return;
+        }
+        if (m_head >= m_buf.size()) {
+            reset_unlocked();
+            return;
+        }
+        // keep the buffer compact once head drifts far enough to matter
+        if (m_head >= COMPACT_THRESHOLD) {
+            m_buf.erase(m_buf.begin(), m_buf.begin() + m_head);
+            m_head = 0;
+        }
+    }
+
+    void reset_unlocked() {
+        m_buf.clear();
+        m_head = 0;
+    }
+
+    static constexpr size_t COMPACT_THRESHOLD = 8192;
+
     std::vector<float>       m_buf;
+    size_t                   m_head     = 0;
     bool                     m_finished = false;
     mutable std::mutex       m_mtx;
     std::condition_variable  m_cv;
@@ -149,6 +191,27 @@ static std::string collect_segments(struct whisper_context * ctx) {
         out += txt;
     }
     return out;
+}
+
+static void append_with_overlap(std::string & accum, const std::string & part) {
+    if (part.empty()) {
+        return;
+    }
+    if (accum.empty()) {
+        accum = part;
+        return;
+    }
+
+    const size_t max_overlap = std::min(accum.size(), part.size());
+    size_t overlap = 0;
+    for (size_t len = max_overlap; len > 0; --len) {
+        if (accum.compare(accum.size() - len, len, part, 0, len) == 0) {
+            overlap = len;
+            break;
+        }
+    }
+
+    accum.append(part.substr(overlap));
 }
 
 // ---------- Helper: timestamped logging ---------------------------------------
@@ -224,8 +287,103 @@ void process_connection(int client_fd, struct whisper_context * ctx) {
     // Adaptive scheduler state
     float   avg_ms   = (float)step_ms; // initialise EWMA
 
+    auto configure_params = [&](whisper_full_params & wparams) {
+        wparams.print_progress   = false;
+        wparams.print_realtime   = false;
+        wparams.print_timestamps = false;
+        wparams.max_tokens       = 0;
+        wparams.n_threads        = n_threads;
+        wparams.beam_search.beam_size = beam_size;
+        wparams.no_speech_thold  = g_no_speech_thold;
+        wparams.suppress_nst     = g_suppress_nst;
+        wparams.vad              = g_enable_vad;
+        wparams.vad_model_path   = g_vad_model_path.empty() ? nullptr : g_vad_model_path.c_str();
+    };
+
     const int n_samples_len  = length_ms * WHISPER_SAMPLE_RATE / 1000;
     const int n_samples_keep = keep_ms   * WHISPER_SAMPLE_RATE / 1000;
+
+    auto run_full_pass = [&](const std::vector<float> & audio) {
+        std::string full_text;
+        if (audio.empty()) {
+            return full_text;
+        }
+
+        const int max_audio_ctx = whisper_model_n_audio_ctx(ctx);
+        size_t max_chunk_samples = 0;
+        if (max_audio_ctx > 0) {
+            max_chunk_samples = size_t(max_audio_ctx) * 2 * WHISPER_HOP_LENGTH;
+        }
+        if (max_chunk_samples == 0) {
+            max_chunk_samples = 30u * WHISPER_SAMPLE_RATE; // fall back to ~30 s chunks
+        }
+
+        const size_t keep_samples = std::max<int32_t>(g_keep_ms, 0) * WHISPER_SAMPLE_RATE / 1000;
+        if (max_chunk_samples <= keep_samples) {
+            max_chunk_samples = keep_samples + (WHISPER_SAMPLE_RATE / 2);
+        }
+
+        std::string prompt = create_whisper_prompt();
+        const char * prompt_cstr = prompt.empty() ? nullptr : prompt.c_str();
+
+        std::vector<float> overlap_tail;
+        size_t offset = 0;
+        int chunk_index = 0;
+
+        while (offset < audio.size()) {
+            size_t remaining = audio.size() - offset;
+            size_t take = std::min(max_chunk_samples, remaining);
+
+            std::vector<float> chunk;
+            chunk.reserve(overlap_tail.size() + take);
+            if (!overlap_tail.empty()) {
+                chunk.insert(chunk.end(), overlap_tail.begin(), overlap_tail.end());
+            }
+            chunk.insert(chunk.end(), audio.begin() + offset, audio.begin() + offset + take);
+
+            whisper_full_params wparams = whisper_full_default_params(beam_size > 1 ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY);
+            configure_params(wparams);
+            wparams.initial_prompt = (chunk_index == 0) ? prompt_cstr : nullptr;
+            wparams.no_context = (chunk_index > 0);
+            wparams.abort_callback = nullptr;
+            wparams.abort_callback_user_data = nullptr;
+
+            if (chunk_index == 0) {
+                if (wparams.initial_prompt) {
+                    std::cerr << "[whisper-socket] Final pass using prompt: \"" << wparams.initial_prompt << "\"" << std::endl;
+                } else {
+                    std::cerr << "[whisper-socket] Final pass using no initial prompt" << std::endl;
+                }
+            }
+
+            auto t_chunk_start = std::chrono::steady_clock::now();
+            int rc = whisper_full(ctx, wparams, chunk.data(), static_cast<int>(chunk.size()));
+            auto t_chunk_end   = std::chrono::steady_clock::now();
+            auto dur_ms        = std::chrono::duration_cast<std::chrono::milliseconds>(t_chunk_end - t_chunk_start).count();
+
+            if (rc != 0) {
+                std::cerr << "whisper_full() failed on chunk " << chunk_index << std::endl;
+                break;
+            }
+
+            std::string part = collect_segments(ctx);
+            append_with_overlap(full_text, part);
+            log_ts("[FINAL] chunk " + std::to_string(chunk_index + 1) + " duration: " + std::to_string(dur_ms) + " ms");
+
+            const size_t chunk_end = offset + take;
+            const size_t tail_len = std::min(keep_samples, take);
+            if (tail_len > 0) {
+                overlap_tail.assign(audio.begin() + chunk_end - tail_len, audio.begin() + chunk_end);
+            } else {
+                overlap_tail.clear();
+            }
+
+            offset = chunk_end;
+            ++chunk_index;
+        }
+
+        return full_text;
+    };
 
     // This buffer must be created before the header read block, so we can
     // forward any audio data that might be received along with the header.
@@ -244,24 +402,6 @@ void process_connection(int client_fd, struct whisper_context * ctx) {
     // Accumulated transcript across all iterations
     std::string transcript_accum;
 
-    auto merge_into_accum = [&](const std::string & part){
-        // Append part to transcript_accum, removing any overlap prefix
-        if (transcript_accum.empty()) {
-            transcript_accum = part;
-            return;
-        }
-        // Find the maximum overlap between end of accum and beginning of part
-        size_t max_overlap = std::min(transcript_accum.size(), part.size());
-        size_t overlap = 0;
-        for (size_t len = max_overlap; len > 0; --len) {
-            if (transcript_accum.compare(transcript_accum.size() - len, len, part, 0, len) == 0) {
-                overlap = len;
-                break;
-            }
-        }
-        transcript_accum += part.substr(overlap);
-    };
-
     auto send_json = [&](const std::string & type, const std::string & text){
         std::string line = std::string("{\"type\":\"") + type + "\",\"text\":\"" + text + "\"}\n";
         write_all(client_fd, line.data(), line.size());
@@ -276,6 +416,14 @@ void process_connection(int client_fd, struct whisper_context * ctx) {
     while (true) {
         // Compute step size and pop corresponding samples from the ring buffer
         const int n_samples_step = step_ms * WHISPER_SAMPLE_RATE / 1000;
+
+        if (!g_no_stream) {
+            const size_t backlog_samples = rb.size();
+            const size_t max_backlog_samples = (size_t)std::max(0, n_samples_len + n_samples_keep);
+            if (backlog_samples > max_backlog_samples) {
+                rb.drop(backlog_samples - max_backlog_samples);
+            }
+        }
 
         std::vector<float> pcmf32_new;
         size_t popped = rb.pop(n_samples_step, pcmf32_new);
@@ -307,16 +455,7 @@ void process_connection(int client_fd, struct whisper_context * ctx) {
 
         if (!g_no_stream) {
             whisper_full_params wparams = whisper_full_default_params(beam_size > 1 ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY);
-            wparams.print_progress   = false;
-            wparams.print_realtime   = false;
-            wparams.print_timestamps = false;
-            wparams.max_tokens       = 0;
-            wparams.n_threads        = n_threads;
-            wparams.beam_search.beam_size = beam_size;
-            wparams.no_speech_thold  = g_no_speech_thold;
-            wparams.suppress_nst     = g_suppress_nst;
-            wparams.vad              = g_enable_vad;
-            wparams.vad_model_path   = g_vad_model_path.empty() ? nullptr : g_vad_model_path.c_str();
+            configure_params(wparams);
 
             // Set app-aware initial prompt for better transcription - get fresh value each time
             std::string prompt = create_whisper_prompt();
@@ -338,7 +477,7 @@ void process_connection(int client_fd, struct whisper_context * ctx) {
             auto t_end   = std::chrono::steady_clock::now();
             auto dur_ms  = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
             std::string part = collect_segments(ctx);
-            merge_into_accum(part);
+            append_with_overlap(transcript_accum, part);
             send_json("partial", part);
             log_ts(std::string("[PART] transcription time: ") + std::to_string(dur_ms) + " ms");
 
@@ -386,39 +525,13 @@ void process_connection(int client_fd, struct whisper_context * ctx) {
     if (!pcmf32_all.empty()) {
         abort_requested.store(false); // ensure final pass is not aborted
         auto t_start = std::chrono::steady_clock::now();
-        whisper_full_params wparams_final = whisper_full_default_params(beam_size > 1 ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY);
-        wparams_final.print_progress   = false;
-        wparams_final.print_realtime   = false;
-        wparams_final.print_timestamps = false;
-        wparams_final.max_tokens       = 0;
-        wparams_final.n_threads        = n_threads;
-        wparams_final.beam_search.beam_size = beam_size;
-        wparams_final.no_speech_thold  = g_no_speech_thold;
-        wparams_final.suppress_nst     = g_suppress_nst;
-        wparams_final.vad              = g_enable_vad;
-        wparams_final.vad_model_path   = g_vad_model_path.empty() ? nullptr : g_vad_model_path.c_str();
-
-        // Set app-aware initial prompt for better transcription - get fresh value for final pass
-        std::string prompt = create_whisper_prompt();
-        wparams_final.initial_prompt = prompt.empty() ? nullptr : prompt.c_str();
-
-        if (wparams_final.initial_prompt) {
-            std::cerr << "[whisper-socket] Final pass using prompt: \"" << wparams_final.initial_prompt << "\"" << std::endl;
-        } else {
-            std::cerr << "[whisper-socket] Final pass using no initial prompt" << std::endl;
-        }
-
-        // No abort callback for final pass (fully process)
-        wparams_final.abort_callback = nullptr;
-        wparams_final.abort_callback_user_data = nullptr;
-
-        if (whisper_full(ctx, wparams_final, pcmf32_all.data(), pcmf32_all.size()) != 0) {
-            std::cerr << "whisper_full() failed on full-audio pass" << std::endl;
+        final_transcript = run_full_pass(pcmf32_all);
+        if (final_transcript.empty()) {
+            final_transcript = transcript_accum;
         }
         auto t_end   = std::chrono::steady_clock::now();
         auto dur_ms  = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
-        final_transcript = collect_segments(ctx);
-        log_ts(std::string("[FINAL] transcription time: ") + std::to_string(dur_ms) + " ms");
+        log_ts(std::string("[FINAL] total duration: ") + std::to_string(dur_ms) + " ms");
     } else {
         // Fallback to whatever we accumulated during streaming (should not happen)
         final_transcript = transcript_accum;
