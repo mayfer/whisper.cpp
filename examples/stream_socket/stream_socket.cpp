@@ -298,6 +298,7 @@ void process_connection(int client_fd, struct whisper_context * ctx) {
         wparams.suppress_nst     = g_suppress_nst;
         wparams.vad              = g_enable_vad;
         wparams.vad_model_path   = g_vad_model_path.empty() ? nullptr : g_vad_model_path.c_str();
+        wparams.no_context       = true;
     };
 
     const int n_samples_len  = length_ms * WHISPER_SAMPLE_RATE / 1000;
