@@ -345,7 +345,7 @@ void process_connection(int client_fd, struct whisper_context * ctx) {
             whisper_full_params wparams = whisper_full_default_params(beam_size > 1 ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY);
             configure_params(wparams);
             wparams.initial_prompt = (chunk_index == 0) ? prompt_cstr : nullptr;
-            wparams.no_context = (chunk_index > 0);
+            wparams.no_context = true; // avoid leaking decoder state between invocations
             wparams.abort_callback = nullptr;
             wparams.abort_callback_user_data = nullptr;
 
