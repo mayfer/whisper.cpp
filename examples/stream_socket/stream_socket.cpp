@@ -5,12 +5,14 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <condition_variable>
 #include <string>
@@ -37,6 +39,7 @@
 // ---- Control socket for app context updates ----
 static const char * CTRL_SOCK_PATH = "/tmp/whisper_ctx.sock";
 static std::string g_app_context;
+static std::string g_prompt_prefix;
 static std::mutex  g_app_mtx;
 
 
@@ -233,11 +236,61 @@ static void log_ts(const std::string & msg) {
 }
 
 // ---------- Helper: create app-aware whisper prompt -----------------------------
+static bool extract_json_string(const std::string & json, const std::string & key, std::string & out) {
+    const std::string needle = "\"" + key + "\":\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos) {
+        return false;
+    }
+
+    pos += needle.size();
+    std::string value;
+    bool escaping = false;
+
+    for (size_t i = pos; i < json.size(); ++i) {
+        const char ch = json[i];
+        if (escaping) {
+            switch (ch) {
+                case '"': value.push_back('"'); break;
+                case '\\': value.push_back('\\'); break;
+                case '/': value.push_back('/'); break;
+                case 'b': value.push_back('\b'); break;
+                case 'f': value.push_back('\f'); break;
+                case 'n': value.push_back('\n'); break;
+                case 'r': value.push_back('\r'); break;
+                case 't': value.push_back('\t'); break;
+                default: value.push_back(ch); break;
+            }
+            escaping = false;
+            continue;
+        }
+
+        if (ch == '\\') {
+            escaping = true;
+            continue;
+        }
+
+        if (ch == '"') {
+            out = value;
+            return true;
+        }
+
+        value.push_back(ch);
+    }
+
+    return false;
+}
+
 static std::string create_whisper_prompt() {
     std::string current_app_copy;
+    std::string prompt_prefix_copy;
     {
         std::lock_guard<std::mutex> lock(g_app_mtx);
         current_app_copy = g_app_context;
+        prompt_prefix_copy = g_prompt_prefix;
+    }
+    if (!prompt_prefix_copy.empty()) {
+        return prompt_prefix_copy;
     }
     if (current_app_copy.empty()) {
         return "";
@@ -259,6 +312,12 @@ static std::atomic<bool> g_no_stream{false};
 static float   g_no_speech_thold = 0.7f;  // no speech threshold
 static bool    g_enable_vad      = false; // enable voice activity detection
 static std::string g_vad_model_path;      // optional path to VAD model
+static float   g_vad_threshold   = 0.5f;  // default VAD speech threshold
+static int32_t g_vad_min_speech_duration_ms = 250;  // default VAD min speech duration
+static int32_t g_vad_speech_pad_ms = 30;   // default VAD speech padding
+static int32_t g_vad_min_silence_duration_ms = 100; // default VAD silence duration
+static float   g_vad_max_speech_duration_s = std::numeric_limits<float>::max(); // default VAD max speech duration
+static float   g_vad_samples_overlap = 0.1f;        // default overlap between segments
 static bool    g_suppress_nst    = false; // suppress non-speech tokens
 
 // Adaptive-scheduler & safety-net ---------------------------------------------
@@ -299,6 +358,12 @@ void process_connection(int client_fd, struct whisper_context * ctx) {
         wparams.vad              = g_enable_vad;
         wparams.vad_model_path   = g_vad_model_path.empty() ? nullptr : g_vad_model_path.c_str();
         wparams.no_context       = true;
+        wparams.vad_params.threshold               = g_vad_threshold;
+        wparams.vad_params.min_speech_duration_ms  = g_vad_min_speech_duration_ms;
+        wparams.vad_params.min_silence_duration_ms = g_vad_min_silence_duration_ms;
+        wparams.vad_params.max_speech_duration_s   = g_vad_max_speech_duration_s;
+        wparams.vad_params.speech_pad_ms           = g_vad_speech_pad_ms;
+        wparams.vad_params.samples_overlap         = g_vad_samples_overlap;
     };
 
     const int n_samples_len  = length_ms * WHISPER_SAMPLE_RATE / 1000;
@@ -583,6 +648,12 @@ int main(int argc, char ** argv) {
                   << "  -nth N, --no-speech-thold N   No speech probability threshold (default: 0.7)\n"
                   << "  --vad                         Enable voice activity detection (VAD) before transcription\n"
                   << "  --vad-model PATH, --vad-path PATH  Path to custom VAD model (.bin)\n"
+                  << "  --vad-threshold F             VAD speech probability threshold (default: 0.5)\n"
+                  << "  --vad-min-speech-duration-ms N  VAD min speech duration in ms (default: 250)\n"
+                  << "  --vad-min-silence-duration-ms N  VAD min silence duration in ms (default: 100)\n"
+                  << "  --vad-max-speech-duration-s F  VAD max speech duration in seconds (default: unlimited)\n"
+                  << "  --vad_speech_pad_ms N          VAD speech padding in ms (default: 30)\n"
+                  << "  --vad-samples-overlap F        VAD segment overlap in seconds (default: 0.1)\n"
                   << "  --no-stream                   Only run final full-context pass after stream ends\n"
                   << "  --ring-cap MS                 Max backlog to keep in ring buffer during streaming (0 = unlimited, default: 30000)\n"
                   << "  -sns, --suppress-nst          Suppress non-speech tokens\n"
@@ -606,6 +677,18 @@ int main(int argc, char ** argv) {
             g_no_speech_thold = std::atof(argv[i + 1]);
         } else if (std::strcmp(argv[i], "--vad-model") == 0 || std::strcmp(argv[i], "--vad-path") == 0) {
             g_vad_model_path = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--vad-threshold") == 0 || std::strcmp(argv[i], "--vad_threshold") == 0) {
+            g_vad_threshold = static_cast<float>(std::atof(argv[i + 1]));
+        } else if (std::strcmp(argv[i], "--vad-min-speech-duration-ms") == 0 || std::strcmp(argv[i], "--vad_min_speech_duration_ms") == 0) {
+            g_vad_min_speech_duration_ms = std::atoi(argv[i + 1]);
+        } else if (std::strcmp(argv[i], "--vad_speech_pad_ms") == 0 || std::strcmp(argv[i], "--vad-speech-pad-ms") == 0) {
+            g_vad_speech_pad_ms = std::atoi(argv[i + 1]);
+        } else if (std::strcmp(argv[i], "--vad-min-silence-duration-ms") == 0 || std::strcmp(argv[i], "--vad_min_silence_duration_ms") == 0) {
+            g_vad_min_silence_duration_ms = std::atoi(argv[i + 1]);
+        } else if (std::strcmp(argv[i], "--vad-max-speech-duration-s") == 0 || std::strcmp(argv[i], "--vad_max_speech_duration_s") == 0) {
+            g_vad_max_speech_duration_s = static_cast<float>(std::atof(argv[i + 1]));
+        } else if (std::strcmp(argv[i], "--vad-samples-overlap") == 0 || std::strcmp(argv[i], "--vad_samples_overlap") == 0) {
+            g_vad_samples_overlap = static_cast<float>(std::atof(argv[i + 1]));
         } else if (std::strcmp(argv[i], "--ring-cap") == 0) {
             g_ring_cap_ms = std::atoi(argv[i + 1]);
             if (g_ring_cap_ms < 0) g_ring_cap_ms = 0;
@@ -675,18 +758,28 @@ int main(int argc, char ** argv) {
             buf[n] = 0;
             std::string line(buf, n);
             if (line.find("\"type\":\"app_context\"") != std::string::npos) {
-                size_t pos = line.find("\"app\":\"");
-                if (pos != std::string::npos) {
-                    pos += 7;
-                    size_t end = line.find('"', pos);
-                    if (end != std::string::npos) {
-                        std::string app = line.substr(pos, end - pos);
-                        {
-                            std::lock_guard<std::mutex> lock(g_app_mtx);
-                            g_app_context = app;
-                        }
-                        std::cerr << "[whisper-socket] Updated app context: " << app << std::endl;
+                std::string app;
+                std::string prompt_prefix;
+                bool changed = false;
+
+                {
+                    std::lock_guard<std::mutex> lock(g_app_mtx);
+                    if (extract_json_string(line, "app", app)) {
+                        g_app_context = app;
+                        changed = true;
                     }
+                    if (extract_json_string(line, "prompt_prefix", prompt_prefix)) {
+                        g_prompt_prefix = prompt_prefix;
+                        changed = true;
+                    }
+                }
+
+                if (changed) {
+                    std::cerr << "[whisper-socket] Updated app context";
+                    if (!app.empty()) {
+                        std::cerr << ": " << app;
+                    }
+                    std::cerr << std::endl;
                 }
             } else if (line.find("\"type\":\"stream\"") != std::string::npos) {
                 bool on = line.find("\"enabled\":true") != std::string::npos;
